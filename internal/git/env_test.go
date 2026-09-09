@@ -217,6 +217,62 @@ func TestNonInteractiveEnv_AbsolutizesRelativeDir(t *testing.T) {
 	}
 }
 
+// TestNonInteractiveEnv_ConsolidatesDuplicateGCPEntries locks in that even
+// when the caller's base contains multiple GIT_CONFIG_PARAMETERS entries
+// (unusual but possible if upstream tooling layered several invocations),
+// the helper produces exactly one consolidated entry with every token
+// preserved and color.ui=never appended idempotently. Multiple entries in
+// cmd.Env would otherwise cause git's parser to NUL-concatenate them, which
+// surfaces as "bogus format in GIT_CONFIG_PARAMETERS" and silently undoes
+// the color override.
+func TestNonInteractiveEnv_ConsolidatesDuplicateGCPEntries(t *testing.T) {
+	got := NonInteractiveEnvFrom([]string{
+		"GIT_CONFIG_PARAMETERS=http.proxy=http://proxy.example.com:8080",
+		"PATH=/usr/bin",
+		"GIT_CONFIG_PARAMETERS='color.ui=always'",
+		"GIT_CONFIG_PARAMETERS=protocol.version=2",
+	}, "")
+
+	// Count occurrences of the key.
+	count := 0
+	var consolidated string
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			count++
+			consolidated = kv
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 GIT_CONFIG_PARAMETERS entry, got %d: %v", count, got)
+	}
+	// Every token from every original entry must survive.
+	for _, want := range []string{
+		"http.proxy=http://proxy.example.com:8080",
+		"'color.ui=always'",
+		"protocol.version=2",
+		"'color.ui=never'",
+	} {
+		if !strings.Contains(consolidated, want) {
+			t.Errorf("consolidated entry = %q, want to contain %q", consolidated, want)
+		}
+	}
+	// color.ui=never must be the last token so git's last-wins parser picks it.
+	if !strings.HasSuffix(consolidated, "'color.ui=never'") {
+		t.Errorf("consolidated entry = %q, want it to end with \"'color.ui=never'\"", consolidated)
+	}
+	// Non-GCP entries must be preserved verbatim.
+	foundPath := false
+	for _, kv := range got {
+		if kv == "PATH=/usr/bin" {
+			foundPath = true
+			break
+		}
+	}
+	if !foundPath {
+		t.Errorf("non-GCP entry PATH=/usr/bin dropped from env: %v", got)
+	}
+}
+
 func TestNonInteractiveEnv_EmptyDirLeavesAmbientPWD(t *testing.T) {
 	t.Setenv("PWD", "/ambient/pwd")
 
