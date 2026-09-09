@@ -1,7 +1,9 @@
 package git
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -22,7 +24,10 @@ func resolveEnv(env []string) map[string]string {
 }
 
 func TestNonInteractiveEnv_SetsGitOverrides(t *testing.T) {
-	got := resolveEnv(NonInteractiveEnv(""))
+	// Use an explicit base so the assertion is independent of any
+	// ambient GIT_CONFIG_PARAMETERS that the host shell may have set
+	// (CI presets and agent harnesses routinely inject color.ui=always).
+	got := resolveEnv(NonInteractiveEnvFrom([]string{}, ""))
 
 	want := map[string]string{
 		"GIT_EDITOR":          "true",
@@ -34,6 +39,88 @@ func TestNonInteractiveEnv_SetsGitOverrides(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("env %s = %q, want %q", k, got[k], v)
 		}
+	}
+	if got["GIT_CONFIG_PARAMETERS"] != "'color.ui=never'" {
+		t.Errorf("env GIT_CONFIG_PARAMETERS = %q, want \"'color.ui=never'\"", got["GIT_CONFIG_PARAMETERS"])
+	}
+}
+
+// TestNonInteractiveEnv_OverridesAmbientColorGuard locks in that an ambient
+// GIT_CONFIG_PARAMETERS='color.ui=always' (set by some agent harnesses and CI
+// presets) cannot leak ANSI escape sequences through Diff / DiffHead / Log.
+// The override must be appended to the existing token list using git's
+// space-separated key=value format so other parameters (such as
+// http.proxy=...) are preserved verbatim.
+func TestNonInteractiveEnv_OverridesAmbientColorGuard(t *testing.T) {
+	got := resolveEnv(NonInteractiveEnvFrom([]string{
+		"GIT_CONFIG_PARAMETERS='color.ui=always'",
+	}, ""))
+
+	value := got["GIT_CONFIG_PARAMETERS"]
+	if value == "" {
+		t.Fatalf("GIT_CONFIG_PARAMETERS missing; full env = %v", got)
+	}
+	// Both the ambient color.ui=always and the override color.ui=never
+	// must be present, with the override last so git's last-wins parser
+	// picks it.
+	if !strings.HasSuffix(value, "'color.ui=never'") {
+		t.Errorf("GIT_CONFIG_PARAMETERS = %q, want it to end with \"'color.ui=never'\"", value)
+	}
+	if !strings.Contains(value, "'color.ui=always'") {
+		t.Errorf("GIT_CONFIG_PARAMETERS = %q, must preserve ambient \"'color.ui=always'\"", value)
+	}
+}
+
+// TestNonInteractiveEnv_PreservesOtherConfigParameters locks in that
+// appending the color.ui=never override does NOT clobber other entries in
+// GIT_CONFIG_PARAMETERS. Some agent harnesses inject http.proxy and other
+// settings via this variable, and silently dropping them would break
+// offline / proxied git operation.
+func TestNonInteractiveEnv_PreservesOtherConfigParameters(t *testing.T) {
+	got := resolveEnv(NonInteractiveEnvFrom([]string{
+		"GIT_CONFIG_PARAMETERS=http.proxy=http://proxy.example.com:8080 'color.ui=always'",
+	}, ""))
+
+	value := got["GIT_CONFIG_PARAMETERS"]
+	if !strings.Contains(value, "http.proxy=http://proxy.example.com:8080") {
+		t.Errorf("GIT_CONFIG_PARAMETERS = %q, want http.proxy preserved", value)
+	}
+	if !strings.Contains(value, "'color.ui=always'") {
+		t.Errorf("GIT_CONFIG_PARAMETERS = %q, want \"'color.ui=always'\" preserved", value)
+	}
+	if !strings.HasSuffix(value, "'color.ui=never'") {
+		t.Errorf("GIT_CONFIG_PARAMETERS = %q, want \"'color.ui=never'\" appended", value)
+	}
+}
+
+// TestNonInteractiveEnv_DisablesColorEndToEnd is a black-box guard against
+// regressions in the env-layer color override. With GIT_CONFIG_PARAMETERS
+// pre-set to force color on (the upstream harness behavior), Diff must still
+// return a plain-text stream that includes the literal "+" prefix instead of
+// the colorized "\x1b[32m+\x1b[m\x1b[32m..." sequence git emits when color
+// is on. This is the test that would have caught the original bug.
+func TestNonInteractiveEnv_DisablesColorEndToEnd(t *testing.T) {
+	dir := initTestRepo(t)
+	ctx := context.Background()
+
+	base := run(t, dir, "git", "rev-parse", "HEAD")
+	writeFile(t, filepath.Join(dir, "color-guard.txt"), "plain line\n")
+	run(t, dir, "git", "add", ".")
+	run(t, dir, "git", "commit", "-m", "add color-guard")
+
+	// Force git to want color on, exactly like the upstream agent harness
+	// does. The helper must still override it.
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'color.ui=always'")
+
+	diff, err := Diff(ctx, dir, base, run(t, dir, "git", "rev-parse", "HEAD"))
+	if err != nil {
+		t.Fatalf("Diff under forced color failed: %v", err)
+	}
+	if strings.Contains(diff, "\x1b[") {
+		t.Fatalf("diff still contains ANSI escapes under forced color: %q", diff)
+	}
+	if !strings.Contains(diff, "+plain line") {
+		t.Fatalf("diff must contain plain \"+plain line\" marker, got: %q", diff)
 	}
 }
 
@@ -127,6 +214,62 @@ func TestNonInteractiveEnv_AbsolutizesRelativeDir(t *testing.T) {
 	}
 	if got["PWD"] != wd {
 		t.Errorf("PWD = %q, want absolute %q for relative dir \".\"", got["PWD"], wd)
+	}
+}
+
+// TestNonInteractiveEnv_ConsolidatesDuplicateGCPEntries locks in that even
+// when the caller's base contains multiple GIT_CONFIG_PARAMETERS entries
+// (unusual but possible if upstream tooling layered several invocations),
+// the helper produces exactly one consolidated entry with every token
+// preserved and color.ui=never appended idempotently. Multiple entries in
+// cmd.Env would otherwise cause git's parser to NUL-concatenate them, which
+// surfaces as "bogus format in GIT_CONFIG_PARAMETERS" and silently undoes
+// the color override.
+func TestNonInteractiveEnv_ConsolidatesDuplicateGCPEntries(t *testing.T) {
+	got := NonInteractiveEnvFrom([]string{
+		"GIT_CONFIG_PARAMETERS=http.proxy=http://proxy.example.com:8080",
+		"PATH=/usr/bin",
+		"GIT_CONFIG_PARAMETERS='color.ui=always'",
+		"GIT_CONFIG_PARAMETERS=protocol.version=2",
+	}, "")
+
+	// Count occurrences of the key.
+	count := 0
+	var consolidated string
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			count++
+			consolidated = kv
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 GIT_CONFIG_PARAMETERS entry, got %d: %v", count, got)
+	}
+	// Every token from every original entry must survive.
+	for _, want := range []string{
+		"http.proxy=http://proxy.example.com:8080",
+		"'color.ui=always'",
+		"protocol.version=2",
+		"'color.ui=never'",
+	} {
+		if !strings.Contains(consolidated, want) {
+			t.Errorf("consolidated entry = %q, want to contain %q", consolidated, want)
+		}
+	}
+	// color.ui=never must be the last token so git's last-wins parser picks it.
+	if !strings.HasSuffix(consolidated, "'color.ui=never'") {
+		t.Errorf("consolidated entry = %q, want it to end with \"'color.ui=never'\"", consolidated)
+	}
+	// Non-GCP entries must be preserved verbatim.
+	foundPath := false
+	for _, kv := range got {
+		if kv == "PATH=/usr/bin" {
+			foundPath = true
+			break
+		}
+	}
+	if !foundPath {
+		t.Errorf("non-GCP entry PATH=/usr/bin dropped from env: %v", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
 )
@@ -59,7 +60,35 @@ func NonInteractiveEnvFrom(base []string, dir string) []string {
 	if base == nil {
 		base = os.Environ()
 	}
-	env := append(append([]string(nil), base...),
+
+	// Force `git diff` / `git log` output to never carry ANSI escapes.
+	// Tooling (some agent harnesses and CI presets) injects
+	// GIT_CONFIG_PARAMETERS='color.ui=always' into the agent's
+	// environment, which leaks ESC[1m...ESC[m tokens into every byte
+	// stream we capture for downstream parsing (notably
+	// internal/git.Diff and DiffHead), causing callers that look for
+	// plain "+added" markers to fail.
+	//
+	// We must NOT simply append a second GIT_CONFIG_PARAMETERS entry:
+	// when the same env key appears more than once in cmd.Env, git's
+	// getenv-based parser concatenates them with a literal NUL byte
+	// (it ignores the second one entirely on most libcs, and on others
+	// it sees "bogus format in GIT_CONFIG_PARAMETERS"). The correct
+	// override is to append a single token to the existing value using
+	// git's documented space-separated key=value format. If no value is
+	// present, we set a minimal one.
+	colorOverride := "'color.ui=never'"
+	// consolidateConfigParameters walks env, finds every entry whose key
+	// is GIT_CONFIG_PARAMETERS, merges their values into a single
+	// space-separated token list, appends colorOverride (idempotently),
+	// and rewrites env so the consolidated entry sits at the first
+	// GIT_CONFIG_PARAMETERS slot with the duplicates dropped. This
+	// matters because git's parser concatenates duplicate keys with a
+	// NUL byte (and on some libcs rejects the format outright), so
+	// leaving two GIT_CONFIG_PARAMETERS entries in env would re-break
+	// Diff / DiffHead under ambient color.
+	env := consolidateConfigParameters(base, colorOverride)
+	env = append(env,
 		"GIT_EDITOR=true",
 		"GIT_SEQUENCE_EDITOR=true",
 		"GIT_TERMINAL_PROMPT=0",
@@ -81,4 +110,63 @@ func NonInteractiveEnvFrom(base []string, dir string) []string {
 		}
 	}
 	return env
+}
+
+// consolidateConfigParameters rewrites env so that exactly one
+// GIT_CONFIG_PARAMETERS entry exists. When the caller passes base with
+// no GIT_CONFIG_PARAMETERS at all, the consolidated entry is appended
+// with token as the only value. When one or more entries are already
+// present, their values are joined with single spaces (git's token
+// separator), token is appended if not already present (idempotent),
+// the result lives at the first GIT_CONFIG_PARAMETERS slot, and every
+// subsequent duplicate is dropped.
+//
+// git parses GIT_CONFIG_PARAMETERS as a single space-separated token
+// list. Leaving multiple entries in env causes libgit2-style code
+// paths to concatenate them with NUL bytes, which surfaces as
+// "bogus format in GIT_CONFIG_PARAMETERS" or a silently ignored second
+// entry, both of which re-introduce the ANSI leak this helper exists
+// to prevent.
+func consolidateConfigParameters(env []string, token string) []string {
+	firstIdx := -1
+	var tokens []string
+	// Pass 1: locate the first GIT_CONFIG_PARAMETERS slot and collect
+	// every existing token (across all duplicate entries) into one
+	// ordered list. Token order is preserved so callers that depend
+	// on a particular color.ui appearing later than http.proxy (for
+	// last-wins override) keep that ordering.
+	for i, kv := range env {
+		if !strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			continue
+		}
+		if firstIdx == -1 {
+			firstIdx = i
+		}
+		tokens = append(tokens, strings.Fields(strings.TrimPrefix(kv, "GIT_CONFIG_PARAMETERS="))...)
+	}
+	// Append token idempotently.
+	for _, t := range tokens {
+		if t == token {
+			token = ""
+			break
+		}
+	}
+	if token != "" {
+		tokens = append(tokens, token)
+	}
+	consolidated := "GIT_CONFIG_PARAMETERS=" + strings.Join(tokens, " ")
+	if firstIdx == -1 {
+		return append(env, consolidated)
+	}
+	// Replace the first GCP entry; drop every subsequent GCP entry.
+	out := make([]string, 0, len(env))
+	out = append(out, env[:firstIdx]...)
+	out = append(out, consolidated)
+	for i := firstIdx + 1; i < len(env); i++ {
+		if strings.HasPrefix(env[i], "GIT_CONFIG_PARAMETERS=") {
+			continue
+		}
+		out = append(out, env[i])
+	}
+	return out
 }
