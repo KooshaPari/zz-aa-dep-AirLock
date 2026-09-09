@@ -92,6 +92,17 @@ func TestMain(m *testing.M) {
 	_ = os.Setenv("HOME", home)
 	_ = os.Setenv("NO_MISTAKES_TELEMETRY", "off")
 	_ = os.Setenv("NO_MISTAKES_NO_UPDATE_CHECK", "1")
+	// Force deterministic, ANSI-free output for every test that captures a
+	// command buffer. Without this, ambient FORCE_COLOR=1 (some agent
+	// harnesses and CI presets) makes termenv believe cmd.OutOrStdout() is a
+	// colored terminal, so lipgloss renders escape sequences into the
+	// captured bytes. Tests that index doctor output by column position then
+	// fail because their lookup sees "\x1b[33m–\x1b[0m \x1b[90mcursor"
+	// instead of the plain "– cursor" they expect.
+	_ = os.Unsetenv("FORCE_COLOR")
+	_ = os.Unsetenv("CLICOLOR_FORCE")
+	_ = os.Setenv("NO_COLOR", "1")
+	_ = os.Setenv("CLICOLOR", "0")
 
 	code := m.Run()
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/runenv"
 )
@@ -59,6 +60,35 @@ func NonInteractiveEnvFrom(base []string, dir string) []string {
 	if base == nil {
 		base = os.Environ()
 	}
+
+	// Force `git diff` / `git log` output to never carry ANSI escapes.
+	// Tooling (some agent harnesses and CI presets) injects
+	// GIT_CONFIG_PARAMETERS='color.ui=always' into the agent's
+	// environment, which leaks ESC[1m...ESC[m tokens into every byte
+	// stream we capture for downstream parsing (notably
+	// internal/git.Diff and DiffHead), causing callers that look for
+	// plain "+added" markers to fail.
+	//
+	// We must NOT simply append a second GIT_CONFIG_PARAMETERS entry:
+	// when the same env key appears more than once in cmd.Env, git's
+	// getenv-based parser concatenates them with a literal NUL byte
+	// (it ignores the second one entirely on most libcs, and on others
+	// it sees "bogus format in GIT_CONFIG_PARAMETERS"). The correct
+	// override is to append a single token to the existing value using
+	// git's documented space-separated key=value format. If no value is
+	// present, we set a minimal one.
+	colorOverride := "'color.ui=never'"
+	hasExistingGCP := false
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			hasExistingGCP = true
+			break
+		}
+	}
+	if hasExistingGCP {
+		base = appendConfigParameters(base, colorOverride)
+	}
+
 	env := append(append([]string(nil), base...),
 		"GIT_EDITOR=true",
 		"GIT_SEQUENCE_EDITOR=true",
@@ -67,6 +97,9 @@ func NonInteractiveEnvFrom(base []string, dir string) []string {
 		// index as a side effect. Mutating commands still take required locks.
 		"GIT_OPTIONAL_LOCKS=0",
 	)
+	if !hasExistingGCP {
+		env = append(env, "GIT_CONFIG_PARAMETERS="+colorOverride)
+	}
 	// Mirror os/exec, which only injects PWD when Cmd.Env is nil, skips it on
 	// these platforms, and absolutizes Cmd.Dir first (go.dev/issue/50599):
 	// POSIX defines PWD as "an absolute pathname of the current working
@@ -79,6 +112,29 @@ func NonInteractiveEnvFrom(base []string, dir string) []string {
 		if abs, err := filepath.Abs(dir); err == nil {
 			env = append(env, "PWD="+abs)
 		}
+	}
+	return env
+}
+
+// appendConfigParameters appends a single "key=value" token to the
+// GIT_CONFIG_PARAMETERS entry already present in env. git parses
+// GIT_CONFIG_PARAMETERS as space-separated key=value tokens, so the
+// existing http.proxy=... and other parameters are preserved verbatim
+// while color.ui=never wins because it appears later.
+func appendConfigParameters(env []string, token string) []string {
+	for i, kv := range env {
+		if !strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			continue
+		}
+		current := strings.TrimPrefix(kv, "GIT_CONFIG_PARAMETERS=")
+		// Avoid duplicating the override if a caller already added it.
+		for _, existing := range strings.Fields(current) {
+			if existing == token {
+				return env
+			}
+		}
+		env[i] = "GIT_CONFIG_PARAMETERS=" + current + " " + token
+		return env
 	}
 	return env
 }
