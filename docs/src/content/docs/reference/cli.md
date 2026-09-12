@@ -35,7 +35,7 @@ no-mistakes init --worktree-root ~/work/my-repo-runs
 
 | Flag              | Type     | Default | Description                                                                                      |
 | ----------------- | -------- | ------- | ------------------------------------------------------------------------------------------------ |
-| `--fork-url`      | `string` | (none)  | GitHub fork remote URL to push branches to while opening PRs against `origin`                  |
+| `--fork-url`      | `string` | (none)  | GitHub fork remote URL to push branches to while opening PRs against `origin`                    |
 | `--worktree-root` | `string` | (none)  | Directory to create this repository's run worktrees in; prints the `worktree_roots` entry to add |
 
 Creates or refreshes a local bare repo, installs the managed pre-receive admission and post-receive notification hooks, best-effort isolates the gate repo's hook path from shared git config changes when Git supports `config --worktree`, adds or repairs the `no-mistakes` git remote, detects the default branch, records or updates the repo in SQLite, installs the `/no-mistakes` agent skill at user level into `~/.claude/skills/no-mistakes/SKILL.md` and `~/.agents/skills/no-mistakes/SKILL.md`, and ensures the daemon is running, installing the managed service when available and falling back to a detached daemon otherwise.
@@ -161,32 +161,24 @@ The same successful-output reporting instructions apply to `axi respond` results
 
 ## no-mistakes axi status
 
-When `--run` is omitted, show this branch's run: its active run, else its most recent one.
-Resolution is scoped to the current branch and never falls back to another branch's run, because one clone commonly has several worktrees on different branches.
-On a successful status response, when the current branch has no run of its own - including a detached `HEAD`, which owns no branch and so reports `current_branch: unknown` - the output carries no run object at all.
-It reports `current_branch`, `runs_on_current_branch: 0` where a branch is known, and the recent-runs listing, so an unrelated run can never be read as this worktree's.
-If the implicit current-branch lookup itself fails, status returns that error instead of presenting the failure as a detached or no-run result.
-Detached-`HEAD` help offers deliberate `--run <id>` inspection or checking out a branch; it does not offer `axi run`, which requires a branch.
-With `--run <id>`, inspect exactly that run regardless of branch; when its branch differs from a known current branch, it is rendered under `other_branch_run:` instead of `run:`, alongside a top-level `current_branch`, so a parser keyed on `run:` never picks up a run proven to be on another branch.
-An explicit `--run <id>` rendered under `run:` while the current branch is unknown (detached `HEAD` or a branch-lookup failure) encodes no branch relationship.
+Show a run, preferring the current branch's active or most recent run before falling back to repo-wide active or recent runs.
 
 ```sh
 no-mistakes axi status
 no-mistakes axi status --run <id>
 ```
 
-| Flag    | Type     | Default            | Description               |
-| ------- | -------- | ------------------ | ------------------------- |
-| `--run` | `string` | current-branch run | Inspect a specific run ID |
+| Flag    | Type     | Default      | Description               |
+| ------- | -------- | ------------ | ------------------------- |
+| `--run` | `string` | resolved run | Inspect a specific run ID |
 
-When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, its top-level `run:` or `other_branch_run:` object includes `awaiting_agent: parked <duration>` immediately after `status`.
-The field disappears after that run's gate is answered, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
-Status offers branch-scoped `axi respond` commands only for the current branch's implicitly resolved run. An explicitly selected gate stays inspection-only even when its branch matches, because a newer active run on that branch could receive the bare response command instead; the gate remains visible and its log commands retain `--run <id>`.
+When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, its top-level `run:` object includes `awaiting_agent: parked <duration>` immediately after `status`.
+The field disappears after `axi respond`, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
 When the resolved run has a `running` or `fixing` step, the run object includes `active_steps`.
 Each row reports how long the step has been active, the latest meaningful log or native-agent lifecycle activity, the native agent PID if one is currently running, and the current round such as `round 1`, `auto-fix 1/3`, or `fix 2`.
 If no activity arrives for longer than `step_quiet_warning`, `last_activity` is prefixed with `quiet`; this is only a liveness signal and does not cancel the step.
 For older active runs with no recorded activity timestamp, AXI falls back to the step log file modification time.
-Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
+Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for the complete step log.
 Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
 
@@ -201,11 +193,11 @@ no-mistakes axi sync --recover
 no-mistakes axi sync --recover --keep-local
 ```
 
-| Flag           | Type   | Default | Description                                                                  |
-| -------------- | ------ | ------- | ---------------------------------------------------------------------------- |
-| `--check`      | `bool` | `false` | Verify the live target and exact plan without changing `HEAD`                |
+| Flag           | Type   | Default | Description                                                                                                                                     |
+| -------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--check`      | `bool` | `false` | Verify the live target and exact plan without changing `HEAD`                                                                                   |
 | `--recover`    | `bool` | `false` | Return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch) |
-| `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree   |
+| `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree                                                                       |
 
 The default command is an explicit non-interactive apply request and never prompts.
 All modes return the complete `branch_sync` object as TOON.
@@ -221,7 +213,7 @@ Run `axi sync` only when structured output offers `next_action.code: sync`; proc
 
 ### Custody recovery
 
-A run that goes terminal (cancelled, failed, or completed without a push stage) after moving the pipeline head leaves the branch `pipeline_owned`. Status offers `next_action.code: recover_custody` only when recovery can establish the same eligibility it will enforce: an equal or ahead local head proves the source locally and can create the local anchor when the gate is unavailable, but any existing gate recovery ref must still match the recorded head; importing a missing preserved head requires an exact run-specific gate anchor (or legacy commit evidence that can be anchored), a clean worktree, and either local ancestry or the content-preservation proof described below. The eligible state reports `safety: blocked_pipeline_owned_recoverable`, the run's terminal `pipeline.status`, and the exact `submitted_head`/`current_head`/`relation` ownership facts.
+A run that goes terminal (cancelled, failed, or completed without a push stage) after moving the pipeline head leaves the branch `pipeline_owned`. Status offers `next_action.code: recover_custody` only with verified source evidence: an equal or ahead local head proves the source locally and can create the local anchor when the gate is unavailable, but any existing gate recovery ref must still match the recorded head; importing a missing preserved head requires an exact run-specific gate anchor (or legacy commit evidence that can be anchored), a clean worktree, and local ancestry. A clean non-ancestral local head whose comparison requires the gate reports `safety: blocked_recover_explicit_verification_required`: cached status deliberately defers the write-capable content-preservation proof to explicit `--recover`. The ordinary eligible state reports `safety: blocked_pipeline_owned_recoverable`, the run's terminal `pipeline.status`, and the exact `submitted_head`/`current_head`/`relation` ownership facts.
 A run whose terminalization verifies that the managed worktree head never changed from the submitted head releases the branch instead: the terminal outcome, including cancellation, ends ownership; status reports `state: user_owned` with the same exact ownership facts and no `next_action`; the branch and head are immediately usable for any separately authorized delivery; and nothing blocks a direct push or PR.
 Without positive evidence that the submitted head stayed unchanged, custody is not guessed away. Missing or conflicting evidence, and import cases with a dirty worktree or genuinely divergent history, require manual reconciliation instead of advertising a recovery that will refuse.
 While a run is still active, it reports `state: pipeline_owned`, the exact submitted/current heads and their relation, and `next_action.code: continue_active_run` with `no-mistakes axi status`, even when its head has not moved yet.
@@ -251,16 +243,13 @@ no-mistakes axi logs --step review --full
 no-mistakes axi logs --step review --run <id>
 ```
 
-| Flag     | Type     | Default            | Description                             |
-| -------- | -------- | ------------------ | --------------------------------------- |
-| `--step` | `string` | (none)             | Step name; required                     |
-| `--run`  | `string` | current-branch run | Run ID to inspect                       |
-| `--full` | `bool`   | `false`            | Show the entire log instead of the tail |
+| Flag     | Type     | Default      | Description                             |
+| -------- | -------- | ------------ | --------------------------------------- |
+| `--step` | `string` | (none)       | Step name; required                     |
+| `--run`  | `string` | resolved run | Run ID to inspect                       |
+| `--full` | `bool`   | `false`      | Show the entire log instead of the tail |
 
-When `--run` is omitted, the run is resolved the same way as [`axi status`](#no-mistakes-axi-status): this branch's run, never another branch's.
-With `--run <id>`, logs are read from exactly that run regardless of branch.
-An unknown explicit run ID exits nonzero with `error: run "<id>" not found` instead of reporting that the current branch has no run.
-Without `--full`, long logs show the last 40 lines and a help hint for the full log; when `--run <id>` selected the log, that hint retains the same run ID.
+Without `--full`, long logs show the last 40 lines and a help hint for the full log.
 Step logs include native subprocess agent lifecycle lines such as `codex started pid=4242`, `codex exited pid=4242 status=success`, and transient retry messages when the selected agent supports lifecycle events.
 They also include fix-loop markers such as `auto-fix round 1/3 starting after round 1` and `user-fix round starting after round 2`.
 
@@ -342,9 +331,9 @@ cancels it before starting over. Treat rerun as a between-runs action after a
 failed or cancelled outcome, or after you have committed a separate fix outside
 an active run; do not use it to bypass a gate.
 
-| Flag | Type | Default | Description |
-| ---- | ---- | ------- | ----------- |
-| `--intent` | `string` | (none) | Explicit intent overriding inherited intent or fresh inference |
+| Flag       | Type     | Default | Description                                                    |
+| ---------- | -------- | ------- | -------------------------------------------------------------- |
+| `--intent` | `string` | (none)  | Explicit intent overriding inherited intent or fresh inference |
 
 ## no-mistakes sync
 
@@ -358,12 +347,12 @@ no-mistakes sync --recover
 no-mistakes sync --recover --keep-local
 ```
 
-| Flag           | Type   | Default | Description                                                     |
-| -------------- | ------ | ------- | --------------------------------------------------------------- |
-| `--check`      | `bool` | `false` | Verify and print the fresh plan without changing `HEAD`         |
-| `-y`, `--yes`  | `bool` | `false` | Apply an eligible guarded synchronization without an interactive prompt |
+| Flag           | Type   | Default | Description                                                                                                                                     |
+| -------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--check`      | `bool` | `false` | Verify and print the fresh plan without changing `HEAD`                                                                                         |
+| `-y`, `--yes`  | `bool` | `false` | Apply an eligible guarded synchronization without an interactive prompt                                                                         |
 | `--recover`    | `bool` | `false` | Return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch) |
-| `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree |
+| `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree                                                                       |
 
 Without `--yes`, apply prints the exact full-SHA plan and requires TTY confirmation; `--recover` prompts the same way before returning custody.
 A non-TTY apply or recovery refuses with a direct `--yes` hint.
@@ -371,7 +360,7 @@ The command uses the same service and safety contract as `no-mistakes axi sync`,
 
 ## no-mistakes status
 
-Show repo, daemon, active run, and relevant cached local-branch synchronization status.
+Show repo, daemon, active run, and cached local-branch synchronization status.
 
 ```sh
 no-mistakes status
@@ -383,6 +372,16 @@ Displays:
 - Gate path
 - Daemon status (running/stopped, PID)
 - Active run details: ID, branch, status, head SHA, start time
+- Cached local repository state: branch, short `HEAD`, cleanliness, and the
+  locally recorded synchronization guidance
+
+The cached local-state line is always present once a repository is registered.
+It is local evidence only: its Git inspection does not fetch or query a Git
+remote, and it does not claim that the remote branch is currently fresh. That
+inspection does not mutate either the invoking repository or local gate Git
+object database, refs, index, or worktree; a Git-status failure is labelled as unavailable rather than as
+confirmed dirtiness. `status` may still record its normal local command
+telemetry separately.
 
 ## no-mistakes runs
 
